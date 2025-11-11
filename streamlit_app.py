@@ -4,7 +4,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 # Your client comes from this package
-from unstract.llmwhisperer import LLMWhispererClientV2
+from llmwhisperer.client import LLMWhispererClientV2
 
 DEFAULT_BASE_URL = "https://llmwhisperer-api.us-central.unstract.com/api/v2"
 

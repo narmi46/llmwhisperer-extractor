@@ -1,62 +1,62 @@
 import os
+import time
 import tempfile
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 
+BASE_URL = "https://llmwhisperer-api.us-central.unstract.com/api/v2"
 
-def whisper_extract(file_path, api_key, mode="high_quality", pages="", vert=False, horiz=False):
-    """
-    Direct REST call to LLMWhisperer API.
-    """
-    url = "https://llmwhisperer-api.us-central.unstract.com/api/v2/whisper"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    data = {
+def whisper_start(file_path, api_key, mode="high_quality", pages="", vert=False, horiz=False, output_mode="layout_preserving"):
+    # params go in the query string per docs
+    params = {
         "mode": mode,
-        "pages_to_extract": pages,
-        "mark_vertical_lines": str(vert).lower(),
-        "mark_horizontal_lines": str(horiz).lower(),
-        "wait_for_completion": "true",
-        "wait_timeout": 200
+        "output_mode": output_mode,
     }
+    if pages:
+        params["pages_to_extract"] = pages
+    if vert:
+        params["mark_vertical_lines"] = "true"
+    if horiz:
+        params["mark_horizontal_lines"] = "true"
 
+    headers = {"unstract-key": api_key}
     with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f, "application/octet-stream")}
-        response = requests.post(url, headers=headers, files=files, data=data)
+        # API expects raw body; multipart generally works, but send raw bytes to match docs
+        resp = requests.post(f"{BASE_URL}/whisper", headers=headers, params=params, data=f)
+    if resp.status_code == 401:
+        raise RuntimeError(f"Auth failed (401). Check key and header. Body: {resp.text}")
+    if resp.status_code not in (202, 200):
+        raise RuntimeError(f"Whisper start failed {resp.status_code}: {resp.text}")
+    return resp.json().get("whisper_hash")
 
-    if response.status_code != 200:
-        raise RuntimeError(f"API error {response.status_code}: {response.text}")
+def whisper_status(whisper_hash, api_key):
+    headers = {"unstract-key": api_key}
+    r = requests.get(f"{BASE_URL}/whisper-status", headers=headers, params={"whisper_hash": whisper_hash})
+    r.raise_for_status()
+    return r.json()
 
-    return response.json()
-
+def whisper_retrieve(whisper_hash, api_key):
+    headers = {"unstract-key": api_key}
+    r = requests.get(f"{BASE_URL}/whisper-retrieve", headers=headers, params={"whisper_hash": whisper_hash})
+    r.raise_for_status()
+    return r.json()
 
 def main():
     st.set_page_config(page_title="LLMWhisperer Extractor", page_icon="🗂️", layout="centered")
-    st.title("🗂️ LLMWhisperer Extractor (No SDK version)")
-    st.write("Upload a document and extract text via LLMWhisperer’s REST API.")
+    st.title("🗂️ LLMWhisperer Extractor (REST)")
 
-    # Load environment variables (.env for local dev)
     load_dotenv(override=False)
-
     api_key = st.secrets.get("LLMWHISPERER_API_KEY", os.getenv("LLMWHISPERER_API_KEY"))
     if not api_key:
         st.error("❌ Missing `LLMWHISPERER_API_KEY`. Add it to .env or Streamlit Secrets.")
         st.stop()
 
     uploaded = st.file_uploader("Choose a file", type=None)
-    mode = st.selectbox(
-        "Extraction mode",
-        ["native_text", "low_cost", "high_quality", "form", "table"],
-        index=2,
-        help="Extraction mode for LLMWhisperer",
-    )
-    pages = st.text_input(
-        "Pages to extract (optional)",
-        placeholder='e.g. "1-5", "7", "1-5,7,21-"',
-    )
+    mode = st.selectbox("Extraction mode", ["native_text", "low_cost", "high_quality", "form", "table"], index=2)
+    pages = st.text_input("Pages to extract (optional)", placeholder='e.g. "1-5", "7", "1-5,7,21-"')
     vert = st.checkbox("Recreate vertical table borders (--vert)", value=False)
     horiz = st.checkbox("Recreate horizontal table borders (--horiz)", value=False)
-
     if horiz and not vert:
         st.warning("⚠️ `--horiz` requires `--vert`.")
 
@@ -72,19 +72,31 @@ def main():
             tmp.write(uploaded.read())
             tmp_path = tmp.name
 
-        st.info(f"Processing **{uploaded.name}** with mode **{mode}** ...")
+        st.info(f"Uploading **{uploaded.name}** (mode **{mode}**) ...")
 
         try:
-            result = whisper_extract(tmp_path, api_key, mode, pages, vert, horiz)
-            status = result.get("status")
-            if status != "processed":
-                st.error(f"Processing status: {status}\n\nMessage: {result.get('message')}")
+            whisper_hash = whisper_start(tmp_path, api_key, mode, pages, vert, horiz)
+            if not whisper_hash:
+                st.error("No whisper_hash received; cannot continue.")
                 return
 
-            extraction = result.get("extraction", {}) or {}
-            text = extraction.get("result_text", "")
-            metadata = extraction.get("metadata", {})
+            with st.spinner("Processing..."):
+                # simple poll loop (max ~200s per docs)
+                t0 = time.time()
+                while True:
+                    status = whisper_status(whisper_hash, api_key)
+                    if status.get("status") == "processed":
+                        break
+                    if status.get("status") == "failed":
+                        st.error(f"Processing failed: {status}")
+                        return
+                    if time.time() - t0 > 200:
+                        st.error("Timed out waiting for completion (200s). Try again or retrieve later.")
+                        return
+                    time.sleep(3)
 
+            data = whisper_retrieve(whisper_hash, api_key)
+            text = (data or {}).get("result_text", "") or data.get("extracted_text", "")
             st.success("✅ Extraction complete.")
             st.text_area("Extracted Text", text, height=350)
             st.download_button(
@@ -93,8 +105,6 @@ def main():
                 file_name=f"{os.path.splitext(uploaded.name)[0]}_extracted.txt",
                 mime="text/plain",
             )
-            if metadata:
-                st.caption(f"Total pages processed: {len(metadata)}")
 
         except Exception as e:
             st.error(f"❌ Error: {e}")
@@ -103,7 +113,6 @@ def main():
                 os.remove(tmp_path)
             except Exception:
                 pass
-
 
 if __name__ == "__main__":
     main()
